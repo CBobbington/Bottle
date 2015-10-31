@@ -13,8 +13,9 @@ SERVER_NAME = "Team 23's Message Bottle Server"
 VIRTUAL_HOST = "/bottle"
 EXCHANGE_NAME = "pebble"
 ROUTING_KEY = "actions"
-MSG_DB = shelve.open("bottle.msgs", writeback=True)
-GPIO_PINS = [11,12,13,15]
+MSG_DB_FILE = "bottle.msgs"
+MSG_DB = shelve.open(MSG_DB_FILE, writeback=True)
+GPIO_PINS = [11,13,15,12]
 GPIO_EN = False
 
 COMMAND_DESC = "RabbitMQ-based server for distribution and storage of text messages"
@@ -23,9 +24,11 @@ LOG_FMT = logging.Formatter(fmt="%(asctime)s [%(levelname)-8s] %(message)s", dat
 LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
 
+# Returns a server name to use for zeroconf advertisement
 def getServiceName():
 	return SERVER_NAME + "._http._tcp.local."
 
+# Returns the IP of either the eth0 or wlan0 interfaces
 def getServiceIP():
 	wlanIfaceAddrs = netifaces.ifaddresses('wlan0')
 	ethIfaceAddrs = netifaces.ifaddresses('eth0')
@@ -39,47 +42,60 @@ def getServiceIP():
 		# Couldn't get IP from either, return None
 		return None, None
 
+# Check if this program is running in the FG
 def isRunningInFg():
 	return os.getpgrp() == os.tcgetpgrp(sys.stdout.fileno())	
 
+# Process a command message from a client
 def processCmd(ch, method, properties, body):
+	# Attempt to parse the message
 	try:
 		msg = json.loads(body)
 	except ValueError:
 		LOG.warn("Could not parse message \'%s\'" % (body,))
 		return
 	
+	# If message does not specify an action or destination it is invalid
 	if "Action" not in msg or "Dest" not in msg:
 		LOG.info("Recieved invalid message \'%s\'" % (msg,))
 		return
 	
+	# Push a message to the server
 	if msg["Action"].lower() == "push":
 		LOG.info("PUSH request recieved")
+		# Initialize the message store
 		if "msgs" not in MSG_DB:
 			MSG_DB['msgs'] = []
+
+		# Add the message, send a success response, and update the LED's
 		MSG_DB['msgs'].append(msg)
 		sendMsg(msg["Dest"], json.dumps({"Status": "success"}))
 		updatePins()
+	# Pull a message from the server
 	elif msg["Action"].lower() == "pull" or msg["Action"].lower() == "pullr":
-		toReturn = {}
+		# No messages available, send failure response
 		if "msgs" not in MSG_DB or len(MSG_DB["msgs"]) == 0:
 			sendMsg(msg["Dest"], json.dumps({"Status": "failed", "Reason": "No messages available"}))
 		else:
+			# Otherwise filter messages by queries and send one
 			msgList = MSG_DB["msgs"]
 			if "Query_Author" in msg and msg["Query_Author"]:
-				msgList = filter(lambda storedMsg: "Author" in storedMsg and fnMatch.fnMatch(storedMsg["Author"], msg["Query_Author"]), msgList)
+				msgList = filter(lambda storedMsg: "Author" in storedMsg and fnmatch.fnmatch(storedMsg["Author"], msg["Query_Author"]), msgList)
 			if "Query_Age" in msg and msg["Query_Age"]:
-				msgList = filter(lambda storedMsg: "Age" in storedMsg and fnMatch.fnMatch(storedMsg["Age"], msg["Query_Age"]), msgList)
+				msgList = filter(lambda storedMsg: "Age" in storedMsg and fnmatch.fnmatch(str(storedMsg["Age"]), str(msg["Query_Age"])), msgList)
 			if "Query_Subject" in msg and msg["Query_Subject"]:
-				msgList = filter(lambda storedMsg: "Subject" in storedMsg and fnMatch.fnMatch(storedMsg["Subject"], msg["Query_Subject"]), msgList)
+				msgList = filter(lambda storedMsg: "Subject" in storedMsg and fnmatch.fnmatch(storedMsg["Subject"], msg["Query_Subject"]), msgList)
 			if "Query_Message" in msg and msg["Query_Message"]:
-				msgList = filter(lambda storedMsg: "Message" in storedMsg and fnMatch.fnMatch(storedMsg["Message"], msg["Query_Message"]), msgList)
+				msgList = filter(lambda storedMsg: "Message" in storedMsg and fnmatch.fnmatch(storedMsg["Message"], msg["Query_Message"]), msgList)
 
-			if len(msgList == 0):
+			# All messages failed the queries
+			if len(msgList) == 0:
 				sendMsg(msg["Dest"], json.dumps({"Status": "failed", "Reason": "No messages available"}))
 			else:
+				# Get a message that matches and send it
 				pulledMsg = msgList[0]
 				if msg["Action"].lower() == "pull":
+					# Delete message from server
 					LOG.info("PULL request recieved")
 					MSG_DB["msgs"].remove(pulledMsg)
 					updatePins()
@@ -87,11 +103,14 @@ def processCmd(ch, method, properties, body):
 					LOG.info("PULLR request recieved")
 				sendMsg(msg["Dest"], json.dumps(pulledMsg))
 	else:
+		# Command is not recognized
 		LOG.info("Recieved message with unknown command \'%s\'" % (msg["Action"]))
-		sendMsg(msg["Dest"], json.dumps({"Status": "failed", "Reason": "Unknown command \'%s\'"} % (msg["Action"])))
-		
+		sendMsg(msg["Dest"], json.dumps({"Status": "failed", "Reason": "Unknown command \'%s\'" % msg["Action"]}))
+
+# Helper function for sending a message to a client's queue		
 def sendMsg(dest, msg):
 	LOG.info("Sending message %s to %s" %(msg, dest,))
+	# Open up another temporary connection to send
 	tempConn = pika.BlockingConnection(pika.ConnectionParameters(host='localhost', virtual_host=VIRTUAL_HOST))
 	tempChan = tempConn.channel()
 	tempChan.queue_declare(queue=str(dest), passive=True)
@@ -107,6 +126,7 @@ def updatePins():
 
 if __name__ == "__main__":
 	# Attempt to configure GPIO
+	GPIO.setwarnings(False)
 	GPIO.setmode(GPIO.BOARD)
 	try:
 		GPIO.setup(GPIO_PINS, GPIO.OUT)
@@ -135,6 +155,7 @@ if __name__ == "__main__":
 		LOG.addHandler(fileHandler)
 		LOG.info("Outputting to logfile \'%s\'" % (args.logfile,))
 
+	# Warn if the GPIO pins couldn't be configured
 	if not GPIO_EN:
 		LOG.warn("Could not configure GPIO pins, make sure this srunning with superuser priveleges!")
 	updatePins()
@@ -188,6 +209,8 @@ if __name__ == "__main__":
 		pass
 	finally:
 		LOG.info("Shutting down server...")
+		shelve.close(MSG_DB_FILE)
+
 		LOG.info("Closing connection with RabbitMQ")
 		if conn is not None:
 			conn.close()
